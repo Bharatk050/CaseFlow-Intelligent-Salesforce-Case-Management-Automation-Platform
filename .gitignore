@@ -1,0 +1,50 @@
+# Credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+backend/.certs/
+
+# Internal support procedures must not be published to the public repository
+backend/data/CA/
+
+# Private tickets, sessions, and browser/runtime artifacts
+backend/support_files/*
+!backend/support_files/.gitkeep
+*.sqlite
+*.sqlite3
+*.sqlite*
+*.db
+*.db-*
+.runtime/
+*.log
+
+# Dependencies, builds, and caches
+node_modules/
+dist/
+build/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.tsbuildinfo
+.pytest_cache/
+.progress-test-cache/
+.test-progress-tmp/
+pytest-cache-files-*/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

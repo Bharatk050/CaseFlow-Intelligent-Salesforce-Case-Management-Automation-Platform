@@ -1,0 +1,19 @@
+﻿# Run from the RQC project folder:
+python backend/run.py
+
+# Or, from inside the backend folder:
+python run.py
+
+# Validate backend imports and certificates without starting:
+python backend/run.py --check
+
+# Build frontend (run from the frontend folder):
+npm run build
+
+# Open https://localhost:8012
+# If RQC is already running, the launcher reuses it rather than starting a second server.
+# Stop the existing server before restarting when you need to load backend changes.
+
+# HTTPS development frontend (run in frontend while backend is running):
+npm run dev
+# Open https://localhost:5173; use localhost and HTTPS for both servers.
