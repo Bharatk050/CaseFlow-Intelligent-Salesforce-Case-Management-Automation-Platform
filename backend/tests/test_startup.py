@@ -30,7 +30,7 @@ def test_launcher_serves_https_and_second_launch_reuses_it():
         while True:
             try:
                 with urlopen(f"https://localhost:{port}/health", context=context, timeout=1) as response:
-                    assert json.load(response) == {"status": "ok"}
+                    assert json.load(response)["status"] == "ok"
                 break
             except OSError:
                 assert process.poll() is None, "Test server exited before becoming healthy"

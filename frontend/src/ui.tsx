@@ -40,11 +40,65 @@ export function EmptyState({ icon = 'inbox', title, children, compact = false }:
   return <div className={`empty-state ${compact ? 'empty-state-compact' : ''}`}><span className="empty-icon"><Icon name={icon} /></span><h3>{title}</h3><p>{children}</p></div>
 }
 
+function GuidanceInline({ text }: { text: string }) {
+  text = visibleGuidanceText(text)
+  return <>{text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((part, index) => part.startsWith('**') ? <strong key={index}>{part.slice(2, -2)}</strong> : part.startsWith('`') ? <code key={index}>{part.slice(1, -1)}</code> : part)}</>
+}
+
+export function visibleGuidanceText(text: string): string {
+  return text.replace(/\s*\[[^\]\n]+#[^\]\n]+\]/g, '')
+    .replace(/\b[\w-]+#\d+-[\w-]+\b/g, '')
+    .replace(/(?:Open|Review|See|Read)\s+(?:the\s+)?Sources and reasoning[^.!?]*[.!?]?/gi, 'Ask an experienced agent to confirm the next action.')
+    .replace(/\b(?:this|the) playbook\s+(?:says|states)\s+(?:that\s+)?/gi, '')
+    .replace(/\b(?:referenced )?playbooks?\b/gi, 'instructions')
+    .replace(/\b(?:cases|reference)\/[\w/.-]+\.md\b/g, '')
+    .trim()
+}
+
 export function GuidanceText({ text }: { text: string }) {
-  return <div className="guidance-text">{text.split('\n').map((line, index) => {
-    const step = line.match(/^\s*(\d+)[.)]\s+(.+)$/)
-    if (step) return <div className="guidance-step" key={index}><span className="step-number">{step[1]}</span><p>{step[2]}</p></div>
-    if (!line.trim()) return null
-    return <p className="guidance-paragraph" key={index}>{line}</p>
-  })}</div>
+  const blocks: ReactNode[] = []
+  let lines: string[] = [], ordered = false, start = 1
+  const flush = () => {
+    if (!lines.length) return
+    const entries = lines.map((line, index) => <li key={index}><GuidanceInline text={line} /></li>)
+    blocks.push(ordered ? <ol key={blocks.length} start={start}>{entries}</ol> : <ul key={blocks.length}>{entries}</ul>)
+    lines = []
+  }
+  for (const line of visibleGuidanceText(text).replace(/\r\n?/g, '\n').replace(/\\n/g, '\n').split('\n')) {
+    const step = line.match(/^\s*(?:(\d+)[.)]|[-*])\s+(.+)$/)
+    if (step) {
+      const nextOrdered = Boolean(step[1])
+      if (lines.length && nextOrdered !== ordered) flush()
+      if (!lines.length) { ordered = nextOrdered; start = Number(step[1] || 1) }
+      lines.push(step[2])
+    } else if (lines.length && /^\s{2,}\S/.test(line)) {
+      lines[lines.length - 1] += ' ' + line.trim()
+    } else {
+      flush()
+      if (/^\s*#{1,6}\s/.test(line)) blocks.push(<h5 className="guidance-subheading" key={blocks.length}><GuidanceInline text={line.replace(/^\s*#{1,6}\s+/, '')} /></h5>)
+      else if (line.trim()) blocks.push(<p className="guidance-paragraph" key={blocks.length}><GuidanceInline text={line} /></p>)
+    }
+  }
+  flush()
+  return <div className="guidance-text">{blocks}</div>
+}
+
+export function GuidanceBullets({ items, ordered = false }: { items: { text: string; source_ids: string[] }[]; ordered?: boolean }) {
+  const List = ordered ? 'ol' : 'ul'
+  const renderItem = (item: typeof items[number], index: number) => <li key={index}>{item.text.trim().split(/\s+/).length > 40 || item.text.includes('\n') ? <details className="guidance-long-item"><summary>{ordered ? `Step ${index + 1}` : `Point ${index + 1}`}: detailed instructions — review before acting</summary><GuidanceText text={item.text} /></details> : <GuidanceInline text={item.text} />}</li>
+  const render = (entries: typeof items) => <List>{entries.map(renderItem)}</List>
+  return <div className="guidance-text">
+    {render(items.slice(0, 4))}
+    {items.length > 4 && <details className="guidance-more"><summary>{ordered ? 'Remaining steps' : 'More details'} ({items.length - 4}) — review before acting</summary>{ordered ? <ol start={5}>{items.slice(4).map((item, index) => renderItem(item, index + 4))}</ol> : <ul>{items.slice(4).map((item, index) => renderItem(item, index + 4))}</ul>}</details>}
+  </div>
+}
+
+export function SavedGuidance({ text }: { text: string }) {
+  const lengthy = text.length > 700 || text.split(/\n|\\n/).filter(line => line.trim()).length > 8
+  if (!lengthy) return <GuidanceText text={text.replace(/\s*\[[^\]\n]+#[^\]\n]+\]/g, '')} />
+  return <div className="saved-guidance">
+    <p>This saved approach uses the older detailed format. Select <strong>Suggest me the approach</strong> for concise, updated guidance.</p>
+    <p className="review-note">Review all saved instructions and approval requirements before acting.</p>
+    <p>Request updated guidance before using these older instructions.</p>
+  </div>
 }

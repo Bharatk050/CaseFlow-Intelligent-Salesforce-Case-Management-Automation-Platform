@@ -26,8 +26,8 @@ def environment(tmp_path, monkeypatch):
     monkeypatch.setenv("SALESFORCE_CLIENT_ID", "test-client")
     monkeypatch.setenv("SALESFORCE_CLIENT_SECRET", "test-secret")
     monkeypatch.setenv("SALESFORCE_REDIRECT_URI", "http://testserver/auth/salesforce/callback")
-    monkeypatch.setenv("ENABLE_OPENAI_TRIAGE", "false")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ENABLE_GEMINI_TRIAGE", "false")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("SALESFORCE_ALLOW_WRITEBACK", raising=False)
     def deny_network(*args, **kwargs):
         raise AssertionError("Unexpected external request")

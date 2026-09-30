@@ -14,8 +14,8 @@ from rag import retrieve_articles
 @pytest.fixture(autouse=True)
 def disable_live_model_calls(monkeypatch):
     """Unit tests use deterministic behavior unless a test supplies a fake model."""
-    monkeypatch.setenv("ENABLE_OPENAI_TRIAGE", "false")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ENABLE_GEMINI_TRIAGE", "false")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
 
 
 def test_roster_login_case_selects_a_playbook_but_requires_human_review():
@@ -49,7 +49,7 @@ def test_urgent_security_request_escalates():
 
 def test_uncertain_request_requires_human():
     result = triage("Could you add this?", "Could you add a new reporting option?")
-    assert result["status"] == "open"
+    assert result["status"] == "escalated"
     assert result["requires_human"]
 
 
@@ -90,7 +90,9 @@ def test_excel_import_accepts_case_export_format(monkeypatch):
 
     assert not skipped
     assert imported[0]["customer"] == "Test District A SD"
-    assert "Case Number: 01540700" in imported[0]["message"]
+    assert imported[0]["message"] == ""
+    assert imported[0]["description_missing"]
+    assert imported[0]["imported_case_fields"]["Case Number"] == "01540700"
     assert imported[0]["imported_case_fields"]["Product"] == "iReady"
     assert imported[0]["case_reason"] == "General Inquiry"
 
@@ -112,7 +114,7 @@ def test_agentic_rag_stops_for_missing_required_procedure():
     result = rag_triage("Start syncing admins", "Please enable the admin sync setting.")
     assert result["category"] == "Syncing Admin Behavior"
     assert result["status"] == "escalated"
-    assert "Stop: this playbook says the required procedure is unavailable" in result["suggested_approach"]
+    assert "Stop: the required procedure is unavailable" in result["suggested_approach"]
 
 
 def test_retriever_never_suggests_a_reference_document():
@@ -128,23 +130,23 @@ def test_rag_uses_enabled_model_without_agent_notes_and_keeps_final_priority(mon
         result["suggested_approach"] = "AI-grounded password reset guidance."
         result["ai_advisory_priority"] = "high"
         result["ai_priority_rationale"] = "The teacher cannot access the system."
-        result["ai_mode"] = "openai_rag_refined"
+        result["ai_mode"] = "gemini_rag_refined"
         return result
 
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("ENABLE_OPENAI_TRIAGE", "true")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("ENABLE_GEMINI_TRIAGE", "true")
     monkeypatch.setattr(main, "apply_model_assist", fake_model)
     result = rag_triage("Password reset", "A teacher forgot their password.")
     assert called["notes"] is None
-    assert result["ai_mode"] == "openai_rag_refined"
+    assert result["ai_mode"] == "gemini_rag_refined"
     assert result["ai_advisory_priority"] == "high"
     assert result["priority"] == "low"
 
 
 def test_model_failure_keeps_deterministic_priority(monkeypatch):
-    import openai
+    from google import genai
     base = triage("Password reset", "A teacher forgot their password.")
-    monkeypatch.setattr(openai, "OpenAI", lambda: (_ for _ in ()).throw(RuntimeError("model unavailable")))
+    monkeypatch.setattr(genai, "Client", lambda: (_ for _ in ()).throw(RuntimeError("model unavailable")))
     result = main.apply_model_assist(base, "Password reset", "A teacher forgot their password.", [], None)
     assert result["priority"] == "low"
     assert result["ai_advisory_priority"] is None

@@ -11,6 +11,8 @@ def mock_view(monkeypatch, *, views=None, records=None, failure=None):
         assert kwargs['token'] == 'fake-access'
         if failure:
             raise HTTPException(502, 'Salesforce request failed. Retry.')
+        if url.endswith('/describe'):
+            return {'fields': [{'name': name} for name in salesforce.CASE_FIELDS.split(', ')]}
         if url.endswith('/listviews'):
             return {'listviews': views if views is not None else [{'id': VIEW, 'label': ' ROSTER SUPPORT QUEUE '}]}
         if '/results?' in url:
@@ -57,6 +59,8 @@ def test_paginated_list_discovery_results_and_hydration(environment, monkeypatch
     ids = [f'500{i:012d}AAA' for i in range(2001)]
     offsets = []
     def response(url, **kwargs):
+        if url.endswith('/describe'):
+            return {'fields': [{'name': name} for name in salesforce.CASE_FIELDS.split(', ')]}
         if url.endswith('/listviews'):
             return {'listviews': [], 'nextRecordsUrl': '/services/data/v60.0/views-next'}
         if url.endswith('/views-next'):
@@ -65,6 +69,8 @@ def test_paginated_list_discovery_results_and_hydration(environment, monkeypatch
         if '/results?' in url:
             offset = int(params['offset'][0]); offsets.append(offset)
             return {'records': [{'columns': [{'fieldNameOrPath': 'Id', 'value': value}]} for value in ids[offset:offset + 2000]]}
+        assert 'Description' in params['q'][0] and 'Reason' in params['q'][0]
+        assert 'CaseReason' not in params['q'][0]
         selected = params['q'][0].split('IN (')[1].rstrip(')').replace("'", '').split(',')
         return {'records': [{'Id': value} for value in reversed(selected)]}
     monkeypatch.setattr(salesforce, '_json_request', response)

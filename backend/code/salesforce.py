@@ -100,6 +100,15 @@ def _json_request(url: str, *, method="GET", token: str | None=None, body: dict 
         with urlopen(Request(url, data=data, headers=headers, method=method), timeout=20) as response:
             raw = response.read().decode(); return json.loads(raw) if raw else {}
     except HTTPError as exc:
+        try:
+            payload = json.loads(exc.read(65536))
+            provider_code = payload[0].get("errorCode", "") if isinstance(payload, list) and payload else ""
+        except (ValueError, TypeError, AttributeError):
+            provider_code = ""
+        if provider_code == "INVALID_FIELD":
+            raise HTTPException(502, "Salesforce Case fields are unavailable. Ask your administrator to verify Case field access, including Description.") from exc
+        if exc.code == 429 or provider_code == "REQUEST_LIMIT_EXCEEDED":
+            raise HTTPException(503, "Salesforce API limit reached. Retry later.") from exc
         if exc.code == 401:
             raise HTTPException(401, "Your Salesforce session has expired. Connect again.") from exc
         if exc.code == 403:
@@ -151,7 +160,7 @@ def _queue(queue_id: str) -> str:
     return queue_id
 def sync_cases(session_id: str | None, queue_id: str) -> list[dict]:
     s, queue_id = _session(session_id), _queue(queue_id)
-    query = "SELECT Id, CaseNumber, Subject, Description, Status, Priority, CaseReason, Type, OwnerId, CreatedDate, LastModifiedDate FROM Case WHERE OwnerId = '" + queue_id + "' ORDER BY CreatedDate DESC"
+    query = "SELECT " + readable_case_fields(s) + " FROM Case WHERE OwnerId = '" + queue_id + "' ORDER BY CreatedDate DESC"
     url = f"{s.instance_url.rstrip('/')}/services/data/v60.0/query?{urlencode({'q':query})}"; records=[]
     while url:
         payload=_json_request(url,token=s.access_token); records.extend(payload.get("records",[])); next_path=payload.get("nextRecordsUrl"); url=f"{s.instance_url.rstrip('/')}{next_path}" if next_path else ""
@@ -163,6 +172,45 @@ def assign_to_me(session_id: str | None, case_id: str) -> str:
     if not SF_ID.fullmatch(case_id): raise HTTPException(400,"Invalid Salesforce Case.")
     _json_request(f"{s.instance_url.rstrip('/')}/services/data/v60.0/sobjects/Case/{case_id}",method="PATCH",token=s.access_token,body={"OwnerId":s.user_id})
     return s.user_id
+
+
+def case_edit_options(session: SalesforceSession) -> dict:
+    describe = _json_request(_api_path(session, "/services/data/v60.0/sobjects/Case/describe"), token=session.access_token)
+    fields = {field["name"]: field for field in describe.get("fields", [])}
+    return {"enabled": writeback_enabled(),
+            "statuses": [{"value": item["value"], "label": item.get("label", item["value"])}
+                         for item in fields.get("Status", {}).get("picklistValues", []) if item.get("active")],
+            "can_edit_status": bool(fields.get("Status", {}).get("updateable")),
+            "can_edit_owner": bool(fields.get("OwnerId", {}).get("updateable"))}
+
+
+def save_case(session: SalesforceSession, case_id: str, fields: dict, note: str) -> dict:
+    """An explicit Save is one atomic Salesforce transaction, never a public reply."""
+    if not writeback_enabled():
+        raise HTTPException(403, "Salesforce saving is disabled. Enable SALESFORCE_ALLOW_WRITEBACK on the server.")
+    if not SF_ID.fullmatch(case_id):
+        raise HTTPException(400, "Invalid Salesforce Case.")
+    options = case_edit_options(session)
+    if "Status" in fields and (not options["can_edit_status"] or fields["Status"] not in {s["value"] for s in options["statuses"]}):
+        raise HTTPException(422, "Choose an editable Salesforce status.")
+    if "OwnerId" in fields and (not options["can_edit_owner"] or not SF_ID.fullmatch(fields["OwnerId"]) or not fields["OwnerId"].startswith(("005", "00G"))):
+        raise HTTPException(422, "Owner must be an accessible Salesforce user or queue ID.")
+    requests = []
+    if fields:
+        requests.append({"method": "PATCH", "url": f"/services/data/v60.0/sobjects/Case/{case_id}", "referenceId": "saveCase", "body": fields})
+    if note:
+        requests.append({"method": "POST", "url": "/services/data/v60.0/sobjects/CaseComment", "referenceId": "saveNote",
+                         "body": {"ParentId": case_id, "CommentBody": note, "IsPublished": False}})
+    if not requests:
+        return {}
+    result = _json_request(_api_path(session, "/services/data/v60.0/composite"), method="POST", token=session.access_token,
+                           body={"allOrNone": True, "collateSubrequests": False, "compositeRequest": requests})
+    responses = result.get("compositeResponse", [])
+    if len(responses) != len(requests):
+        raise HTTPException(502, "Salesforce save could not be confirmed. Refresh the Case in Salesforce before retrying to avoid duplicate comments.")
+    if any(not 200 <= item.get("httpStatusCode", 0) < 300 for item in responses):
+        raise HTTPException(422, "Salesforce rejected the save. Check field permissions, record-type status values, owner access, and required fields in Salesforce. No changes were saved by this transaction.")
+    return fields
 
 def accessible_case_ids(session: SalesforceSession, case_ids: list[str]) -> set[str]:
     """Recheck current record visibility with this user's Salesforce token."""
@@ -180,7 +228,15 @@ def disconnect(session_id: str | None) -> None:
 
 
 ROSTER_VIEW_LABEL = "Roster support Queue"
-CASE_FIELDS = "Id, CaseNumber, Subject, Description, Status, Priority, CaseReason, Type, OwnerId, CreatedDate, LastModifiedDate"
+CASE_FIELDS = "Id, CaseNumber, Subject, Description, Status, Priority, Reason, Type, OwnerId, CreatedDate, LastModifiedDate"
+
+
+def readable_case_fields(session: SalesforceSession) -> str:
+    description = _json_request(_api_path(session, "/services/data/v60.0/sobjects/Case/describe"), token=session.access_token)
+    available = {field["name"] for field in description.get("fields", [])}
+    if not {"Id", "Subject", "Description"} <= available:
+        raise HTTPException(403, "Salesforce Case read access must include Id, Subject and Description. Ask your administrator to enable those fields.")
+    return ", ".join(field for field in CASE_FIELDS.split(", ") if field in available)
 
 
 def display_name(session: SalesforceSession) -> str:
@@ -246,9 +302,10 @@ def roster_support_cases(session: SalesforceSession) -> tuple[dict | None, list[
         offset += len(records)
     # Fetch full workspace fields without changing the saved view's criteria.
     cases = {}
+    fields = readable_case_fields(session) if ids else CASE_FIELDS
     for start in range(0, len(ids), 100):
         selected = ",".join("'" + value + "'" for value in ids[start:start + 100])
-        query = f"SELECT {CASE_FIELDS} FROM Case WHERE Id IN ({selected})"
+        query = f"SELECT {fields} FROM Case WHERE Id IN ({selected})"
         path = "/services/data/v60.0/query?" + urlencode({"q": query})
         visited = set()
         while path:

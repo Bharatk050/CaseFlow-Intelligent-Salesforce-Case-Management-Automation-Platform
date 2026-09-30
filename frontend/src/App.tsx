@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './styles.css'
 import { ProgressPage } from './ProgressPage'
-import { Badge, EmptyState, GuidanceText, Icon, humanize } from './ui'
+import { Badge, EmptyState, GuidanceBullets, GuidanceText, SavedGuidance, Icon, humanize, visibleGuidanceText } from './ui'
 const API = (import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'https://localhost:8012' : window.location.origin)).replace(/\/$/, '')
 type Connection = { configured: boolean; connected: boolean; display_name?: string | null; queues: { id: string; name: string }[]; selected_queue_id: string | null; last_synced_at: string | null; can_assign: boolean }
-type Ticket = { source?: string; imported_case_fields?: Record<string, string>; requires_human?: boolean; ai_mode?: string; created_at?: string; id: string; subject: string; customer: string; message: string; status: string; priority: string; owner?: string; resolution_note?: string; case_reason?: string; salesforce_case_id?: string; salesforce_case_number?: string; salesforce_status?: string; salesforce_priority?: string; salesforce_owner_id?: string; suggested_approach?: string; rationale?: string; ai_advisory_priority?: string; rag_articles?: { slug: string; title: string }[]; activity?: { at: string; member_name: string; action: string }[] }
+type Ticket = { response_type?: string; reply_available?: boolean; retrieval_mode?: string; description_missing?: boolean; guidance_stale?: boolean; case_summary?: string; missing_information?: string[]; reply_draft?: string; source?: string; imported_case_fields?: Record<string, string>; requires_human?: boolean; ai_mode?: string; created_at?: string; id: string; subject: string; customer: string; message: string; status: string; priority: string; owner?: string; resolution_note?: string; case_reason?: string; salesforce_case_id?: string; salesforce_case_number?: string; salesforce_status?: string; salesforce_priority?: string; salesforce_owner_id?: string; suggested_approach?: string; rationale?: string; ai_advisory_priority?: string; rag_articles?: { slug: string; title: string; sections?: { section_id: string; heading: string }[] }[]; activity?: { at: string; member_name: string; action: string }[] }
 type Performance = { id: string; name: string; case_updates: number; suggestions_requested: number; cases_touched: number }
+type StructuredGuidance = { answer_bullets?: { text: string; source_ids: string[] }[]; agent_steps?: { text: string; source_ids: string[] }[]; mandatory_constraints?: string[]; evidence_details?: { source_id: string; heading: string; text: string }[] }
 const disconnected: Connection = { configured: false, connected: false, queues: [], selected_queue_id: null, last_synced_at: null, can_assign: false }
 class ApiError extends Error {
   constructor(message: string, readonly status: number) { super(message) }
@@ -60,7 +61,7 @@ function App() {
     }
     if (!connected && !local) { clearPrivateData(); return }
     try {
-      const scope = connected ? '' : '?local_only=true'
+      const scope = local ? '?local_only=true' : ''
       const [items, activity] = await Promise.all([api<Ticket[]>(`/tickets${scope}`), api<Performance[]>(`/team/performance${scope}`)])
       let rosterCases: Ticket[] = []
       if (connected) {
@@ -72,7 +73,7 @@ function App() {
           setRosterState(result.state); setRosterCount(result.count)
           setConnection(current => ({ ...current, last_synced_at: result.last_synced_at }))
         } catch (error) {
-          if (error instanceof ApiError && error.status === 401) { setConnection(disconnected); clearPrivateData(); throw error }
+          if (error instanceof ApiError && error.status === 401) { setConnection(disconnected) }
           setRosterState('error'); setRosterCount(0)
           setRosterError(error instanceof Error ? error.message : 'Unable to retrieve the Salesforce list view.')
         }
@@ -106,7 +107,8 @@ function App() {
   const update = async (path: string, options: RequestInit) => {
     const item = await api<Ticket>(path, options)
     setTickets(current => current.map(ticket => ticket.id === item.id ? item : ticket))
-    setPerformance(await api<Performance[]>(`/team/performance${connection.connected ? '' : '?local_only=true'}`))
+    try { setPerformance(await api<Performance[]>(`/team/performance${connection.connected ? '' : '?local_only=true'}`)) }
+    catch { setNotice('Case saved. Activity totals could not be refreshed.') }
   }
   const connectSalesforce = () => void run(async () => {
     setConnectionState('loading')
@@ -119,7 +121,8 @@ function App() {
       // An expired cookie must not prevent a fresh OAuth login.
       if (!(error instanceof ApiError && error.status === 401)) {
         setConnectionState('failed')
-        throw new Error('Could not check Salesforce connection. Open the HTTPS backend once to trust its localhost certificate, then retry. Confirm the backend is running.')
+        if (error instanceof ApiError) throw error
+        throw new Error('Your browser could not reach the backend. Check https://localhost:8012/health in this browser, then retry. If it shows a certificate warning, trust the local certificate first.')
       }
       setConnectionState('ready')
     }
@@ -200,7 +203,7 @@ function App() {
                 </tr>)}
               </tbody></table><div className="list-footer">Showing {filtered.length} of {tickets.length} cases<span>Local tracking status</span></div></div> : <div className="list-empty"><EmptyState icon={hasFilters ? 'search' : 'inbox'} title={hasFilters ? 'No matching cases' : connection.connected ? (rosterState === 'loading' ? 'Loading cases...' : rosterState === 'missing' ? 'No queue found' : rosterState === 'error' ? 'Unable to load cases' : 'No cases') : 'A fresh start for your queue'}>{hasFilters ? 'Try a different search or clear your filters to see more cases.' : connection.connected ? 'Use Refresh cases to check the Roster support Queue list view again, or upload an Excel workbook.' : 'Upload an Excel workbook or connect Salesforce. Your cases will appear here.'}</EmptyState>{hasFilters && <button className="button button-secondary" onClick={clearFilters}>Clear all filters</button>}</div>}
             </section>
-            {selected ? <CaseDetails key={selected.id} ticket={selected} busy={busy} canAssign={connection.can_assign} run={run} update={update} /> : <aside className="details-empty"><EmptyState icon="file" title="Your next step starts here">Select a case to explore its details, request handling guidance, and record your work.</EmptyState><div className="empty-capabilities"><span><Icon name="sparkles" />Playbook-grounded guidance</span><span><Icon name="shield" />Human-reviewed actions</span></div></aside>}
+            {selected ? <CaseDetails key={selected.id} ticket={selected} busy={busy} canAssign={connection.can_assign} run={run} update={update} /> : <aside className="details-empty"><EmptyState icon="file" title="Your next step starts here">Select a case to explore its details, request handling guidance, and record your work.</EmptyState><div className="empty-capabilities"><span><Icon name="sparkles" />Clear handling guidance</span><span><Icon name="shield" />Human-reviewed actions</span></div></aside>}
           </div>
         </section>
         <section className="performance-panel" aria-label="My activity"><div className="section-heading"><span className="section-icon"><Icon name="activity" /></span><div><h2>My activity</h2><p>Your work, in view.</p></div></div><div className="performance-members">{performance.length ? performance.map(member => <div className="performance-member" key={member.id}><div className="member-identity"><span className="avatar"><Icon name="user" /></span><span title={member.name}>{member.name}</span></div><div className="performance-stats"><span><strong>{member.cases_touched}</strong>Cases touched</span><span><strong>{member.case_updates}</strong>Case updates</span><span><strong>{member.suggestions_requested}</strong>Suggestions requested</span></div></div>) : <p className="muted">Your case activity will appear as you work.</p>}</div></section>
@@ -218,19 +221,28 @@ function Filter({ label, value, set, values }: { label: string; value: string; s
   return <select className="filter-select" aria-label={label} value={value} onChange={event => set(event.target.value)}><option value="">{label}</option>{values.map(item => <option key={item} value={item}>{humanize(item)}</option>)}</select>
 }
 
-function CaseDetails({ ticket, busy, canAssign, run, update }: { ticket: Ticket; busy: boolean; canAssign: boolean; run: (action: () => Promise<void>) => Promise<void>; update: (path: string, options: RequestInit) => Promise<void> }) {
-  const [status, setStatus] = useState(ticket.status), [owner, setOwner] = useState(ticket.owner ?? ''), [note, setNote] = useState(ticket.resolution_note ?? '')
-  const [notes, setNotes] = useState(''), [article, setArticle] = useState('')
+function CaseDetails({ ticket, busy, canAssign, run, update }: { ticket: Ticket & StructuredGuidance; busy: boolean; canAssign: boolean; run: (action: () => Promise<void>) => Promise<void>; update: (path: string, options: RequestInit) => Promise<void> }) {
+  const isSalesforce = ticket.source === 'salesforce'
+  const [sfOptions, setSfOptions] = useState<{ enabled: boolean; statuses: { value: string; label: string }[]; can_edit_status: boolean; can_edit_owner: boolean } | null>(null)
+  const [sfError, setSfError] = useState(''), [saveNotice, setSaveNotice] = useState('')
+  const [status, setStatus] = useState(isSalesforce ? ticket.salesforce_status ?? '' : ticket.status), [owner, setOwner] = useState(isSalesforce ? ticket.salesforce_owner_id ?? '' : ticket.owner ?? ''), [note, setNote] = useState(ticket.resolution_note ?? '')
+  const [notes, setNotes] = useState('')
   const [analyzing, setAnalyzing] = useState(false), [saving, setSaving] = useState(false), [assigning, setAssigning] = useState(false)
-  useEffect(() => { setStatus(ticket.status); setOwner(ticket.owner ?? ''); setNote(ticket.resolution_note ?? '') }, [ticket.status, ticket.owner, ticket.resolution_note])
+  useEffect(() => { setStatus(isSalesforce ? ticket.salesforce_status ?? '' : ticket.status); setOwner(isSalesforce ? ticket.salesforce_owner_id ?? '' : ticket.owner ?? ''); setNote(ticket.resolution_note ?? '') }, [isSalesforce, ticket.status, ticket.salesforce_status, ticket.owner, ticket.salesforce_owner_id, ticket.resolution_note])
+  useEffect(() => {
+    let active = true
+    setSfOptions(null); setSfError(''); setSaveNotice('')
+    if (isSalesforce) api<NonNullable<typeof sfOptions>>(`/tickets/${ticket.id}/salesforce-edit-options`).then(value => { if (active) setSfOptions(value) }).catch(error => { if (active) setSfError(error instanceof Error ? error.message : 'Unable to load Salesforce editing options.') })
+    return () => { active = false }
+  }, [ticket.id, isSalesforce])
   const needsApproval = Boolean(ticket.suggested_approach) && (['high', 'critical'].includes(ticket.priority) || /controlled action|written authorization|employee must approve|explicit confirmation/i.test(`${ticket.rationale || ''} ${ticket.suggested_approach}`))
   const requestGuidance = async () => {
     setAnalyzing(true)
     try { await run(() => update(`/tickets/${ticket.id}/suggest-approach`, json({ agent_notes: notes || null }))) }
     finally { setAnalyzing(false) }
   }
-  const actions: Record<string, string> = { requested_suggestion: 'Requested AI handling suggestion', updated_case: 'Updated local case details' }
-  const modelGuidance = ticket.ai_mode === 'openai_rag_refined'
+  const actions: Record<string, string> = { requested_suggestion: 'Requested AI handling suggestion', updated_case: 'Updated local case details', saved_salesforce: 'Saved changes to Salesforce' }
+  const modelGuidance = ['gemini_rag_refined', 'openai_rag_refined'].includes(ticket.ai_mode || '')
   return <aside className="case-details" aria-label="Selected case details">
     <div className="detail-header"><div className="detail-topline"><span className="detail-kicker"><Icon name="file" />CASE DETAILS</span><Badge value={ticket.status} /></div><h2>{ticket.subject}</h2><div className="detail-subtitle"><span className="detail-id" title={ticket.id}>{ticket.salesforce_case_number || ticket.id}</span><span className="detail-divider">/</span><Badge kind="priority" value={ticket.priority} /></div></div>
     <div className="detail-body">
@@ -238,7 +250,7 @@ function CaseDetails({ ticket, busy, canAssign, run, update }: { ticket: Ticket;
         <dl className="metadata-grid"><div><dt>Customer</dt><dd>{ticket.customer || 'Not provided'}</dd></div><div><dt>Case reason</dt><dd>{ticket.case_reason || 'Not specified'}</dd></div>
           {ticket.salesforce_case_id && <><div><dt>Salesforce status</dt><dd>{ticket.salesforce_status || 'Not specified'}</dd></div><div><dt>Salesforce priority</dt><dd>{ticket.salesforce_priority || 'Not specified'}</dd></div><div className="metadata-full"><dt>Salesforce owner</dt><dd>{ticket.salesforce_owner_id || 'Unassigned'}</dd></div></>}
         </dl>
-        <div className="case-description"><span className="field-caption">Description</span><p>{ticket.message}</p></div>
+        <div className="case-description"><span className="field-caption">Description</span><p>{ticket.description_missing || !ticket.message ? "No description supplied. Guidance will request clarification." : ticket.message}</p></div>
         {ticket.imported_case_fields && Object.keys(ticket.imported_case_fields).length > 0 && <details className="imported-metadata"><summary><Icon name="layers" />Imported case metadata<Icon name="chevron" /></summary><dl className="metadata-grid">{Object.entries(ticket.imported_case_fields).map(([field, value]) => <div key={field}><dt>{field}</dt><dd>{value}</dd></div>)}</dl></details>}
         {ticket.salesforce_case_id && canAssign && <button className="button button-secondary full-width" disabled={busy} onClick={() => { setAssigning(true); void run(() => update(`/cases/${ticket.salesforce_case_id}/assign-me`, { method: 'POST' })).finally(() => setAssigning(false)) }}><Icon name="user" />{assigning ? 'Assigning...' : 'Assign to Me in Salesforce'}</button>}
       </section>
@@ -248,22 +260,34 @@ function CaseDetails({ ticket, busy, canAssign, run, update }: { ticket: Ticket;
         <button className="button button-guidance full-width" disabled={busy} aria-busy={analyzing} onClick={() => void requestGuidance()}><Icon name={analyzing ? 'sync' : 'sparkles'} className={analyzing ? 'spin' : ''} />{analyzing ? 'Analyzing case...' : 'Suggest me the approach'}{!analyzing && <Icon name="arrow" />}</button>
         <div className="guidance-output" aria-live="polite" aria-busy={analyzing}>
           {analyzing ? <div className="guidance-loading" role="status"><div className="loading-title"><Icon name="sparkles" /><span>Analyzing case...</span></div><p>Reviewing case context and relevant playbooks.</p><div className="skeleton-line" /><div className="skeleton-line" /><div className="skeleton-line short" /></div> : ticket.suggested_approach ? <div className="suggestion-card">
-            <div className="suggestion-heading"><span className="suggestion-mark"><Icon name="sparkles" /></span><div><h4>{modelGuidance ? 'AI Handling Suggestion' : 'Handling Suggestion'}</h4><p>{modelGuidance ? 'AI-refined / playbook-grounded' : 'Playbook-grounded operational guidance'}</p></div><span className="guidance-badge">{modelGuidance ? 'AI GUIDANCE' : 'GUIDANCE'}</span></div>
-            <GuidanceText text={ticket.suggested_approach} />
+            <div className="suggestion-heading"><span className="suggestion-mark"><Icon name="sparkles" /></span><div><h4>{modelGuidance ? 'AI Handling Suggestion' : 'Handling Suggestion'}</h4><p>{modelGuidance ? 'Concise guidance for your review' : 'Next steps for your review'}</p></div><span className="guidance-badge">{modelGuidance ? 'AI GUIDANCE' : 'GUIDANCE'}</span></div>
+            {ticket.case_summary && ticket.response_type !== 'answer' && <div className="guidance-summary"><span className="field-caption">Case interpretation</span><p>{visibleGuidanceText(ticket.case_summary)}</p></div>}
+            {!!ticket.answer_bullets?.length && <div className="guidance-block"><span className="field-caption">Answer</span><GuidanceBullets items={ticket.answer_bullets} /></div>}
+            {!!ticket.agent_steps?.length && <div className="guidance-block"><span className="field-caption">Agent steps</span><GuidanceBullets items={ticket.agent_steps} ordered /></div>}
+            {!ticket.answer_bullets?.length && !ticket.agent_steps?.length && <SavedGuidance text={ticket.suggested_approach} />}
+            {!!ticket.mandatory_constraints?.length && <div className="guidance-missing guidance-checks"><span className="field-caption">Required checks</span><ul>{ticket.mandatory_constraints.map((item, index) => <li key={index}>{visibleGuidanceText(item)}</li>)}</ul></div>}
+            {!!ticket.missing_information?.length && <div className="guidance-missing"><span className="field-caption">Details to confirm</span><ul>{ticket.missing_information.map((item, index) => <li key={index}>{visibleGuidanceText(item)}</li>)}</ul></div>}
             {needsApproval ? <div className="approval-warning"><Icon name="alert" /><div><strong>Approval Required</strong><p>This action requires employee authorization before execution. Follow all approval and escalation requirements in the guidance.</p></div></div> : ticket.requires_human && <div className="review-note"><Icon name="shield" /><span>Employee review required before taking action.</span></div>}
             {ticket.ai_advisory_priority && <div className="advisory-priority"><span>AI advisory priority</span><Badge kind="priority" value={ticket.ai_advisory_priority} /></div>}
           </div> : <div className="guidance-empty"><Icon name="sparkles" /><p>Your guidance will appear here.<span>Request an approach when you're ready.</span></p></div>}
         </div>
-        {ticket.suggested_approach && ticket.rationale && <div className="guidance-rationale"><span className="field-caption">Why this approach</span><p>{ticket.rationale}</p></div>}
-        {!ticket.suggested_approach && ticket.rationale && <details className="rationale-disclosure"><summary>Current assessment</summary><p>{ticket.rationale}</p></details>}
-        {!!ticket.rag_articles?.length && <div className="sources"><span className="field-caption">Referenced playbooks</span>{ticket.rag_articles.map(source => <button className="source-link" key={source.slug} disabled={busy} onClick={() => void run(async () => { const articles = await api<{ slug: string; content: string }[]>('/knowledge-base'); setArticle(articles.find(item => item.slug === source.slug)?.content ?? 'Article unavailable.') })}><Icon name="book" /><span>{source.title}</span><Icon name="chevron" /></button>)}</div>}
-        {article && <div className="article-preview"><div><span className="field-caption">Playbook reference</span><button className="icon-button" onClick={() => setArticle('')} aria-label="Close playbook"><Icon name="close" /></button></div><pre>{article}</pre></div>}
+        {ticket.guidance_stale && <p role="status" className="review-note">The case description changed. Request updated guidance.</p>}
+        {ticket.reply_available === false && ticket.suggested_approach && <p className="review-note">Customer drafting is unavailable. Ask an experienced agent to review the case before preparing a reply.</p>}
+        {ticket.reply_draft && ticket.reply_available !== false && <div className="reply-draft"><span className="field-caption">Customer reply draft</span><p className="muted">Review the wording and case details before copying and sending.</p><GuidanceText text={ticket.reply_draft} /><details><summary>Exact text to copy</summary><textarea aria-label="Customer reply draft" readOnly value={ticket.reply_draft} /></details><button className="button button-secondary" disabled={busy} onClick={() => void run(async () => { await navigator.clipboard.writeText(ticket.reply_draft || '') })}>Copy draft</button></div>}
       </section>
 
-      <section className="detail-section tracking-section"><div className="section-title"><Icon name="layers" /><h3>Local case tracking</h3><span className="source-tag">LOCAL</span></div><p className="section-description">These notes and status changes are saved in this dashboard.</p>
-        <div className="tracking-grid"><label className="form-field" htmlFor="local-status"><span>Status</span><select id="local-status" value={status} onChange={event => setStatus(event.target.value)}>{['open', 'in_progress', 'resolved', 'escalated'].map(value => <option key={value} value={value}>{humanize(value)}</option>)}</select></label><label className="form-field" htmlFor="local-owner"><span>Owner</span><input id="local-owner" maxLength={80} value={owner} onChange={event => setOwner(event.target.value)} placeholder="Assign an owner" /></label></div>
-        <label className="form-field" htmlFor="resolution-note"><span>Resolution note</span><textarea id="resolution-note" maxLength={3000} value={note} onChange={event => setNote(event.target.value)} placeholder="Record findings, progress, or next steps..." /></label>
-        <div className="tracking-footer"><span><Icon name="shield" />Saved to this workspace</span><button className="button button-primary" disabled={busy} onClick={() => { setSaving(true); void run(() => update(`/tickets/${ticket.id}`, json({ status, owner, resolution_note: note }, 'PATCH'))).finally(() => setSaving(false)) }}><Icon name={saving ? 'sync' : 'save'} className={saving ? 'spin' : ''} />{saving ? 'Saving...' : 'Save local changes'}</button></div>
+      <section className="detail-section tracking-section"><div className="section-title"><Icon name="layers" /><h3>{isSalesforce ? 'Salesforce case editing' : 'Local case tracking'}</h3><span className="source-tag">{isSalesforce ? 'SALESFORCE' : 'LOCAL'}</span></div><p className="section-description">{isSalesforce ? 'Save updates the Salesforce status and owner. Changed notes are added as internal Case Comments.' : 'These notes and status changes are saved in this dashboard.'}</p>
+        <div className="tracking-grid"><label className="form-field" htmlFor="local-status"><span>Status</span><select id="local-status" disabled={isSalesforce && !sfOptions?.can_edit_status} value={status} onChange={event => setStatus(event.target.value)}>{isSalesforce ? <>{!sfOptions?.statuses.some(item => item.value === status) && <option value={status}>{status || 'Loading...'}</option>}{sfOptions?.statuses.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</> : ['open', 'in_progress', 'resolved', 'escalated'].map(value => <option key={value} value={value}>{humanize(value)}</option>)}</select></label><label className="form-field" htmlFor="local-owner"><span>{isSalesforce ? 'Owner (Salesforce user or queue ID)' : 'Owner'}</span><input id="local-owner" disabled={isSalesforce && !sfOptions?.can_edit_owner} maxLength={isSalesforce ? 18 : 80} value={owner} onChange={event => setOwner(event.target.value)} placeholder="Assign an owner" /></label></div>
+        <label className="form-field" htmlFor="resolution-note"><span>{isSalesforce ? 'Internal Case Comment' : 'Resolution note'}</span><textarea id="resolution-note" maxLength={3000} value={note} onChange={event => setNote(event.target.value)} placeholder="Record findings, progress, or next steps..." /></label>
+        {isSalesforce && (sfError || (sfOptions && !sfOptions.enabled)) && <p role="alert">{sfError || 'Salesforce saving is disabled on this server.'}</p>}
+        {saveNotice && <p role="status">{saveNotice}</p>}
+        <div className="tracking-footer"><span><Icon name="shield" />{isSalesforce ? 'Saves directly to Salesforce' : 'Saved to this workspace'}</span><button className="button button-primary" disabled={busy || (isSalesforce && !sfOptions?.enabled)} onClick={() => {
+          setSaving(true); setSaveNotice('')
+          void run(async () => {
+            await update(isSalesforce ? `/tickets/${ticket.id}/save-salesforce` : `/tickets/${ticket.id}`, json({ status, owner, resolution_note: note }, isSalesforce ? 'POST' : 'PATCH'))
+            setSaveNotice(isSalesforce ? 'Saved to Salesforce.' : 'Saved locally.')
+          }).finally(() => setSaving(false))
+        }}><Icon name={saving ? 'sync' : 'save'} className={saving ? 'spin' : ''} />{saving ? 'Saving...' : isSalesforce ? 'Save to Salesforce' : 'Save local changes'}</button></div>
       </section>
 
       <section className="detail-section activity-section"><div className="section-title"><Icon name="activity" /><h3>Case activity</h3><span className="small-count">{ticket.activity?.length ?? 0}</span></div>

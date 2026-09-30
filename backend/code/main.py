@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -22,10 +23,11 @@ from dotenv import load_dotenv
 from openpyxl import load_workbook
 
 try:  # Supports both `uvicorn code.main:app` and direct test imports.
-    from .rag import retrieve_articles
-    from . import salesforce, local_beta
+    from .rag import retrieve_articles, load_documents, retrieve_evidence
+    from . import salesforce, local_beta, guidance
 except ImportError:  # pragma: no cover
-    from rag import retrieve_articles
+    from rag import retrieve_articles, load_documents, retrieve_evidence
+    import guidance
     import salesforce
     import local_beta
 
@@ -33,6 +35,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 # This application is configured from its project-local environment file.  Override
 # inherited empty placeholders so a local restart uses the values the operator set.
 load_dotenv(BASE_DIR / ".env", override=True)
+BUILD_ID = hashlib.sha256(b"".join(path.read_bytes() for path in sorted((BASE_DIR / "code").glob("*.py")))).hexdigest()[:12]
 TICKETS_DIR = BASE_DIR / "support_files"
 HELP_CENTER_DIR = BASE_DIR / "data" / "CA"
 FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
@@ -49,11 +52,11 @@ ROSTER_CASES = {
     "No Classes Assigned": ("not-assigned-to-classes", r"\b(not assigned to any classes|no classes assigned)\b"),
     "Student Reactivation": ("student-reactivation", r"\b(reactiv\w*|student id number is already in use)\b"),
     "User Deactivation": ("user-deactivation", r"\b(deactiv\w*|zz_?closed|to be deactivated)\b"),
-    "Filter Change": ("filter-change", r"\b(filter|add|remove|subject|course|school|grade)\b"),
+    "Filter Change": ("filter-change", r"\b(filters?|add (?:a |new )?(?:school|grade|subject|course))\b"),
     "Student ID Conversion": ("student-id-conversion", r"\b(student id|id conversion)\b"),
     "Push or Sync": ("push-sync", r"\b(push|sync|model)\b"),
     "Threshold Override": ("threshold-overrides", r"\b(threshold|nightly job)\b"),
-    "Password Reset": ("password-reset", r"\b(password reset|reset password|forgot password|locked out)\b"),
+    "Password Reset": ("password-reset", r"\b(password reset|reset (?:their |my |the )?password|forgot (?:their |my |the )?password|locked out)\b"),
     "Credential Update": ("credential-updates", r"\b(credential|username|auto_)\b"),
     "Admin Account Creation": ("admin-account-creation", r"\b(create|new)\b.*\badmin\b|\badmin\b.*\b(create|new)\b"),
     "Syncing Admin Behavior": ("syncing-admin-behavior", r"\b(syncing admins?|admin sync)\b"),
@@ -74,13 +77,19 @@ HUMAN_PATTERNS = {
 class TicketCreate(BaseModel):
     subject: str = Field(min_length=3, max_length=160)
     customer: str = Field(min_length=2, max_length=80)
-    message: str = Field(min_length=5, max_length=5000)
+    message: str = Field(min_length=5, max_length=32000)
 
 
 class TicketUpdate(BaseModel):
     status: Literal["open", "in_progress", "resolved", "escalated"] | None = None
     owner: str | None = Field(default=None, max_length=80)
     resolution_note: str | None = Field(default=None, max_length=3000)
+
+
+class SalesforceSave(BaseModel):
+    status: str = Field(min_length=1, max_length=255)
+    owner: str = Field(min_length=15, max_length=18)
+    resolution_note: str = Field(default="", max_length=3000)
 
 
 class SuggestionRequest(BaseModel):
@@ -171,13 +180,7 @@ def case_reason(ticket: dict) -> str | None:
 
 
 def load_articles() -> list[dict]:
-    articles = []
-    paths = sorted({*HELP_CENTER_DIR.glob("*.md"), *HELP_CENTER_DIR.glob("*.md.txt")})
-    for path in paths:
-        raw = path.read_text(encoding="utf-8")
-        first_line = next((line[2:].strip() for line in raw.splitlines() if line.startswith("# ")), path.name.removesuffix(".md.txt").removesuffix(".md"))
-        articles.append({"slug": path.name.removesuffix(".md.txt").removesuffix(".md"), "title": first_line, "content": raw})
-    return articles
+    return load_documents(HELP_CENTER_DIR)
 
 
 def classify(text: str) -> str:
@@ -202,22 +205,17 @@ def category_for_slug(slug: str) -> str:
 
 
 def select_playbook(subject: str, message: str) -> tuple[str, dict | None, list[dict], float, str]:
-    """Plan retrieval in two stages: precise case signal, then KB retrieval."""
-    query = f"{subject} {message}"
-    retrieved = retrieve_articles(HELP_CENTER_DIR, query)
-    classified_category = classify(query)
-    known_article = find_article(classified_category, query, load_articles())
-    if known_article:
-        retrieved_match = next((item for item in retrieved if item["slug"] == known_article["slug"]), None)
-        article = retrieved_match or known_article
-        return classified_category, article, retrieved, 0.92 if retrieved_match and retrieved_match.get("matched_aliases") else 0.82, "Matched the Roster Support case router."
+    """Select evidence from the description; broad subject keywords cannot route it."""
+    if not message.strip() or message.startswith(("Imported case details:", "No case description")):
+        return "Needs Routing", None, [], 0.0, "The customer description is missing."
+    retrieved = retrieve_articles(HELP_CENTER_DIR, message, subject=subject)
     if retrieved:
         top = retrieved[0]
-        # Without a router match, only select a playbook when a declared alias
-        # matches or the title/case type has clear evidence. Otherwise ask to route.
-        strong_match = bool(top.get("matched_aliases")) or top.get("raw_score", 0) >= 8
+        description_category = classify(message)
+        corroborated = description_category != "Needs Routing" and category_for_slug(top["slug"]) == description_category
+        strong_match = bool(top.get("matched_aliases")) or top.get("title_matches", 0) >= 2 or corroborated
         if strong_match:
-            return category_for_slug(top["slug"]), top, retrieved, 0.74, "Matched the knowledge-base case metadata."
+            return category_for_slug(top["slug"]), top, retrieved, 0.82, "Matched description evidence to knowledge-base sections."
     return "Needs Routing", None, retrieved, 0.35, "No sufficiently specific case-playbook match was found."
 
 
@@ -253,7 +251,7 @@ def playbook_steps(content: str, limit: int = 3) -> list[str]:
     return steps
 
 
-def build_suggestion(article: dict | None) -> tuple[str | None, str, str, bool]:
+def build_suggestion(article: dict | None, description: str = "") -> tuple[str | None, str, str, bool]:
     """Return suggested approach, priority, reason, and escalation status."""
     if not article:
         return (
@@ -269,7 +267,10 @@ def build_suggestion(article: dict | None) -> tuple[str | None, str, str, bool]:
     destructive = metadata.get("destructive_steps")
     sensitive = metadata.get("data_sensitivity") == "high"
     owner = metadata.get("owner")
-    unavailable = "[Procedure not available]" in article["content"]
+    unavailable = "[Procedure not available]" in article["content"] or (
+        "[Procedure not available for non-Clever sources.]" in article["content"]
+        and guidance.sync_source(description) != "clever"
+    )
     needs_escalation = bool(owner or unavailable)
     if destructive or sensitive:
         priority = "high" if priority != "low" else "medium"
@@ -278,7 +279,7 @@ def build_suggestion(article: dict | None) -> tuple[str | None, str, str, bool]:
 
     approach = [
         "Review Provisioning Notes; confirm the account, sync source, requester authority, SSO mode, and affected-user count.",
-        *playbook_steps(article["content"]),
+        f"Review the applicable conditional branch in {article['title']} before proposing changes.",
     ]
     if destructive:
         approach.append("Prepare the change only after written authorization and explicit confirmation of scope; an employee must approve or execute it.")
@@ -303,10 +304,15 @@ def build_suggestion(article: dict | None) -> tuple[str | None, str, str, bool]:
 
 def triage(subject: str, message: str, *, category: str | None = None, article: dict | None = None, confidence: float | None = None, retrieval_reason: str | None = None) -> dict:
     text = f"{subject} {message}"
-    category = category or classify(text)
-    article = article or find_article(category, text, load_articles())
+    if category is None:
+        category, article, _, confidence, retrieval_reason = select_playbook(subject, message)
     matches = [reason for reason, pattern in HUMAN_PATTERNS.items() if re.search(pattern, text, re.I)]
-    suggestion, priority, playbook_reason, needs_escalation = build_suggestion(article)
+    suggestion, priority, playbook_reason, needs_escalation = build_suggestion(article, message)
+    counts = re.findall(r"\b(\d+)\s+(?:users?|students?|teachers?|admins?)\b", message, re.I)
+    large_scope = any(int(count) > 10 for count in counts) or re.search(r"\b(?:more than 10|over 10|eleven|twelve|twenty|hundred)\s+(?:users?|students?|teachers?|admins?)\b", message, re.I)
+    if category in {"Student Reactivation", "User Deactivation"} and large_scope:
+        needs_escalation = True
+        playbook_reason += " More than 10 affected users require Provisioning Data Services and a workbook request."
     if article is None or (confidence is not None and confidence < 0.7):
         needs_escalation = True
         playbook_reason += " Low-confidence requests require human escalation."
@@ -341,20 +347,26 @@ def triage(subject: str, message: str, *, category: str | None = None, article: 
 def rag_triage(subject: str, message: str, agent_notes: str | None = None) -> dict:
     """Retrieve help-center context before applying the safe local triage policy.
 
-    An OpenAI key may be configured later for drafting, but the deterministic
+    A Gemini key may be configured later for drafting, but the deterministic
     safety gate remains the authority for automatic closure and escalation.
     """
     category, article, matches, confidence, retrieval_reason = select_playbook(subject, message)
-    result = triage(subject, message, category=category, article=article, confidence=confidence, retrieval_reason=retrieval_reason)
-    result["rag_articles"] = [{
-        "title": item["title"], "slug": item["slug"], "score": item["score"],
-        "matched_aliases": item.get("matched_aliases", []),
-    } for item in matches]
+    result = triage(subject, message + ("\nAgent notes: " + agent_notes if agent_notes else ""), category=category, article=article, confidence=confidence, retrieval_reason=retrieval_reason)
+    evidence, retrieval_mode = retrieve_evidence(HELP_CENTER_DIR, message)
+    matches = guidance.context_articles(HELP_CENTER_DIR, matches if article else [], message)
+    known = {item["slug"] for item in matches}
+    for item in evidence:
+        if item["slug"] not in known and guidance.relevant_article(item, message, article["slug"] if article else None):
+            matches.append({**item, "evidence_sections": guidance.applicable_sections(item, message, full=item["type"] == "case")})
+            known.add(item["slug"])
+    result["retrieval_mode"] = retrieval_mode
+    result = guidance.local_guidance(result, article, message, matches)
     result["ai_mode"] = "rule_based_rag"
+    result["ai_unavailable_reason"] = None
     # An agent explicitly requested this suggestion, so optional model assist
     # may refine the approach and provide an advisory severity assessment.
     # The deterministic CA/safety priority remains the queue authority.
-    if os.getenv("OPENAI_API_KEY") and os.getenv("ENABLE_OPENAI_TRIAGE", "false").lower() == "true":
+    if os.getenv("GEMINI_API_KEY") and os.getenv("ENABLE_GEMINI_TRIAGE", "false").lower() == "true":
         result = apply_model_assist(result, subject, message, matches, agent_notes)
     return result
 
@@ -373,59 +385,55 @@ def pending_approach() -> dict:
         "auto_resolution": None,
         "rag_articles": [],
         "ai_mode": "not_requested",
+        "ai_unavailable_reason": None,
+        "response_type": None,
+        "answer_bullets": [],
+        "agent_steps": [],
+        "evidence_details": [],
+        "retrieval_mode": None,
+        "case_summary": None,
+        "missing_information": [],
+        "reply_draft": None,
+        "reply_source_ids": [],
+        "reply_available": False,
+        "mandatory_constraints": [],
+        "guidance_stale": False,
         "ai_advisory_priority": None,
         "ai_priority_rationale": None,
     }
 
 
 def apply_model_assist(result: dict, subject: str, message: str, matches: list[dict], agent_notes: str | None) -> dict:
-    """Refine a suggestion and return advisory priority; deterministic gates win."""
+    """Generate validated, cited guidance; retain deterministic policy on failure."""
     try:
-        from openai import OpenAI
-
-        schema = {
-            "type": "object",
-            "properties": {
-                "refined_suggestion": {"type": "string", "maxLength": 2200},
-                "advisory_priority": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
-                "priority_rationale": {"type": "string", "maxLength": 500},
-            },
-            "required": ["refined_suggestion", "advisory_priority", "priority_rationale"],
-            "additionalProperties": False,
-        }
-        context = "\n\n".join(f"[{article['title']}]\n{article['content']}" for article in matches)
-        response = OpenAI().responses.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
-            store=False,
-            instructions=("Refine the supplied local knowledge-base approach for an internal support agent and assess case urgency. "
-                          "Use only the supplied playbooks. Keep it concise and actionable. Preserve every stop, escalation, authorization, PII, and human-review requirement. "
-                          "Never invent links, internal steps, facts, or outcomes; if the playbook is incomplete, explicitly say to stop and escalate. "
-                          "The priority is advisory only: assess the customer impact and urgency in the case, but do not claim it overrides the supplied deterministic safety priority."),
-            input=(f"Case subject: {subject}\nCase message: {message}\n\n"
-                   f"Agent refinement notes: {agent_notes or 'None provided.'}\n\n"
-                   f"Deterministic safety priority (authoritative for the queue): {result['priority']}\n\n"
-                   f"Current deterministic approach:\n{result['suggested_approach']}\n\n"
-                   f"Help-center context:\n{context}"),
-            text={"format": {"type": "json_schema", "name": "ticket_triage", "strict": True, "schema": schema}},
-        )
-        model_result = json.loads(response.output_text)
-        refined = model_result["refined_suggestion"].strip()
-        if refined:
-            result["suggested_approach"] = refined
-            result["rationale"] = f"{result['rationale']} AI refinement was applied using the retrieved playbooks."
-        result["ai_advisory_priority"] = model_result["advisory_priority"]
-        result["ai_priority_rationale"] = model_result["priority_rationale"].strip()
-        result["ai_mode"] = "openai_rag_refined"
-    except Exception as exc:
+        return guidance.refine(result, subject, message, matches, agent_notes,
+                               os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
+    except Exception as error:
+        # Provider errors can contain request data. Never expose or log them.
         result["ai_mode"] = "rule_based_rag_fallback"
         result["ai_advisory_priority"] = None
         result["ai_priority_rationale"] = None
-        result["rationale"] = f"{result['rationale']} Model assistance was unavailable; the safe local policy was used."
-    return result
+        result["ai_unavailable_reason"] = {
+            "RateLimitError": "rate_limited", "AuthenticationError": "configuration", "PermissionDeniedError": "configuration",
+            "ValueError": "invalid_response", "ValidationError": "invalid_response", "JSONDecodeError": "invalid_response",
+        }.get(type(error).__name__, "unavailable")
+        code = getattr(error, "status_code", None) or getattr(error, "code", None)
+        if code == 429:
+            result["ai_unavailable_reason"] = "rate_limited"
+        elif code in {400, 401, 403, 404}:
+            result["ai_unavailable_reason"] = "configuration"
+        if getattr(error, "code", None) in {"insufficient_quota", "billing_hard_limit_reached"}:
+            result["ai_unavailable_reason"] = "quota_exhausted"
+        reason = {"quota_exhausted": "Gemini quota is exhausted. Review billing before retrying.",
+                  "rate_limited": "Gemini temporarily rate limited generation.",
+                  "configuration": "AI service authentication or permissions require server-side review.",
+                  "invalid_response": "AI output failed grounding or response validation.",
+                  "unavailable": "Model assistance was unavailable."}[result["ai_unavailable_reason"]]
+        result["rationale"] += f" {reason} Local guidance requires human review."
+        return result
 
 
-# The supported launcher runs one worker. Serialize all ticket mutations and
-# atomically replace files so readers never observe partially written JSON.
+# One supported worker; serialize mutations and atomically replace ticket files.
 TICKET_LOCK = threading.RLock()
 
 
@@ -472,11 +480,12 @@ def import_excel_tickets(contents: bytes, *, created_by: str | None = None, inst
 
     if not headers:
         raise HTTPException(status_code=400, detail="The workbook is empty.")
-    normalized = {str(value).strip().lower(): index for index, value in enumerate(headers) if value is not None}
+    normalize_header = lambda value: re.sub(r"[\s_]+", " ", str(value).strip().lower())
+    normalized = {normalize_header(value): index for index, value in enumerate(headers) if value is not None}
+    description_columns = [normalized[name] for name in ("description", "case description", "message", "details") if name in normalized]
     fields = {
         "subject": next((normalized[name] for name in ("subject", "title") if name in normalized), None),
         "customer": next((normalized[name] for name in ("customer", "customer name", "contact", "name", "account name") if name in normalized), None),
-        "message": next((normalized[name] for name in ("message", "description", "case description", "details") if name in normalized), None),
     }
     missing = [name for name in ("subject", "customer") if fields[name] is None]
     if missing:
@@ -485,6 +494,8 @@ def import_excel_tickets(contents: bytes, *, created_by: str | None = None, inst
     imported: list[dict] = []
     skipped: list[str] = []
     for row_number, row in enumerate(rows, start=2):
+        if not any(value is not None and str(value).strip() for value in row):
+            continue
         if len(imported) >= 200:
             skipped.append("Only the first 200 valid rows were imported.")
             break
@@ -493,17 +504,10 @@ def import_excel_tickets(contents: bytes, *, created_by: str | None = None, inst
             for index, header in enumerate(headers) if header is not None
         }
         values = {name: str(row[index]).strip() if index is not None and index < len(row) and row[index] is not None else "" for name, index in fields.items()}
-        if not values["message"]:
-            case_details = [
-                f"{label}: {row_values[label]}"
-                for label in ("Case Number", "Case Reason", "Case Sub Reason", "Product", "State", "Segment", "Priority", "Case Owner")
-                if row_values.get(label)
-            ]
-            values["message"] = "Imported case details: " + "; ".join(case_details)
-        if not any(values.values()):
-            continue
-        if not (3 <= len(values["subject"]) <= 160 and 2 <= len(values["customer"]) <= 80 and 5 <= len(values["message"]) <= 5000):
-            skipped.append(f"Row {row_number} was skipped: Subject (3-160), Customer (2-80), and Message (5-5000) are required.")
+        values["message"] = next((str(row[index]).strip() for index in description_columns
+                                  if index < len(row) and row[index] is not None and str(row[index]).strip()), "")
+        if not (3 <= len(values["subject"]) <= 160 and 2 <= len(values["customer"]) <= 80 and len(values["message"]) <= 32000):
+            skipped.append(f"Row {row_number} was skipped: Subject (3-160), Customer (2-80), and Description (up to 32000 characters) are supported.")
             continue
         ticket_id = f"IMP-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}-{row_number}"
         ticket = {
@@ -513,6 +517,7 @@ def import_excel_tickets(contents: bytes, *, created_by: str | None = None, inst
             "salesforce_instance_url": instance_url,
             "imported_case_fields": {key: value for key, value in row_values.items() if value},
             "case_reason": row_values.get("Case Reason") or None,
+            "description_missing": not bool(values["message"]),
             **values,
             "owner": None,
             "resolution_note": None,
@@ -556,7 +561,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "build": BUILD_ID}
 
 
 @app.get("/tickets")
@@ -629,12 +634,13 @@ def suggest_ticket_approach(ticket_id: str, payload: SuggestionRequest, request:
     """Run retrieval and triage only after an agent requests an approach."""
     ticket = authorized_ticket(ticket_id, request)
     member = require_member(request, ticket)
-    result = rag_triage(ticket["subject"], ticket["message"], payload.agent_notes)
+    description = "" if ticket.get("description_missing") else ticket["message"]
+    result = rag_triage(ticket["subject"], description, payload.agent_notes)
     workflow_status = ticket["status"]
     ticket.update(result)
     if result["status"] != "escalated":
         ticket["status"] = workflow_status
-    record_activity(ticket, member, "requested_suggestion", {"used_ai_refinement": bool(payload.agent_notes)})
+    record_activity(ticket, member, "requested_suggestion", {"used_ai_refinement": result["ai_mode"] == "gemini_rag_refined"})
     ticket["updated_at"] = now()
     return save_ticket(ticket)
 
@@ -653,6 +659,38 @@ def update_ticket(ticket_id: str, payload: TicketUpdate, request: Request) -> di
     ticket.update(changes)
     record_activity(ticket, member, "updated_case", {"fields": sorted(changes)})
     ticket["updated_at"] = now()
+    return save_ticket(ticket)
+
+
+@app.get("/tickets/{ticket_id}/salesforce-edit-options")
+def salesforce_edit_options(ticket_id: str, request: Request) -> dict:
+    ticket = authorized_ticket(ticket_id, request)
+    if ticket.get("source") != "salesforce":
+        raise HTTPException(400, "This is not a Salesforce case.")
+    return salesforce.case_edit_options(salesforce._session(sf_session_id(request)))
+
+
+@app.post("/tickets/{ticket_id}/save-salesforce")
+@serialized_ticket_write
+def save_salesforce_ticket(ticket_id: str, payload: SalesforceSave, request: Request) -> dict:
+    ticket = authorized_ticket(ticket_id, request)
+    if ticket.get("source") != "salesforce":
+        raise HTTPException(400, "This is not a Salesforce case.")
+    member = require_member(request, ticket)
+    session = salesforce._session(sf_session_id(request))
+    fields = {}
+    if payload.status != ticket.get("salesforce_status"):
+        fields["Status"] = payload.status
+    if payload.owner != ticket.get("salesforce_owner_id"):
+        fields["OwnerId"] = payload.owner
+    note = payload.resolution_note.strip()
+    # Repeated Save without an edited note must not duplicate the comment.
+    new_note = note if note != ticket.get("salesforce_saved_note", "") else ""
+    salesforce.save_case(session, ticket["salesforce_case_id"], fields, new_note)
+    ticket.update(salesforce_status=payload.status, salesforce_owner_id=payload.owner,
+                  owner=payload.owner, resolution_note=note, salesforce_saved_note=note,
+                  salesforce_saved_at=now(), updated_at=now())
+    record_activity(ticket, member, "saved_salesforce", {"fields": sorted(fields), "internal_comment_added": bool(new_note)})
     return save_ticket(ticket)
 
 
@@ -750,14 +788,24 @@ def mirror_salesforce_case(case: dict, instance_url: str) -> dict:
         "id": mirror_id, "source": "salesforce", "salesforce_case_id": case_id,
         "salesforce_instance_url": instance_url,
         "salesforce_case_number": case.get("CaseNumber"), "subject": case.get("Subject") or f"Salesforce case {case.get('CaseNumber', case_id)}",
-        "customer": "Salesforce case", "message": case.get("Description") or "No case description was supplied.",
+        "customer": "Salesforce case", "message": case.get("Description") or "",
+        "description_missing": not bool((case.get("Description") or "").strip()),
         "salesforce_status": case.get("Status"), "salesforce_priority": case.get("Priority"),
-        "salesforce_case_reason": case.get("CaseReason"), "salesforce_type": case.get("Type"),
+        "salesforce_case_reason": case.get("Reason", case.get("CaseReason")), "salesforce_type": case.get("Type"),
         "salesforce_owner_id": case.get("OwnerId"), "salesforce_created_at": case.get("CreatedDate"),
-        "salesforce_last_modified_at": case.get("LastModifiedDate"), "case_reason": case.get("CaseReason") or existing.get("case_reason"),
+        "salesforce_last_modified_at": case.get("LastModifiedDate"), "case_reason": case.get("Reason", case.get("CaseReason")),
         "owner": existing.get("owner"), "resolution_note": existing.get("resolution_note"),
         "created_at": existing.get("created_at", case.get("CreatedDate") or now()), "updated_at": now(),
     }
+    if existing and any(existing.get(field) != ticket[field] for field in ("subject", "message")):
+        # Invalidate generated content only, preserving agent workflow and history.
+        reset = pending_approach()
+        for field in ("suggested_approach", "rag_articles", "ai_mode", "ai_unavailable_reason", "ai_advisory_priority", "ai_priority_rationale",
+                      "case_summary", "missing_information", "reply_draft", "reply_source_ids", "mandatory_constraints", "recommended_article", "confidence",
+                      "answer_bullets", "agent_steps", "evidence_details", "response_type", "retrieval_mode"):
+            ticket[field] = reset[field]
+        ticket["guidance_stale"] = True
+        ticket["rationale"] = "The subject or description changed. Request new guidance using the updated case details."
     return save_ticket(ticket)
 
 
